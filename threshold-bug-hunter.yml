@@ -1,0 +1,318 @@
+name: Threshold AI Bug Hunter
+
+"on":
+  workflow_dispatch:
+  schedule:
+    # Every day at 04:17 UTC = 09:47 IST
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: threshold-bug-hunt
+  cancel-in-progress: true
+
+jobs:
+  hunt:
+    name: Safe Threshold Security Research
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout hunter
+        uses: actions/checkout@v4
+
+      - name: Clone Threshold tBTC
+        run: |
+          git clone --depth 500 \
+            https://github.com/threshold-network/tbtc-v2.git target
+
+      - name: Record target revision
+        run: |
+          mkdir -p findings
+          cd target
+          {
+            echo "# Target Revision"
+            echo
+            echo "Commit:"
+            git rev-parse HEAD
+            echo
+            echo "Recent commits:"
+            git log --oneline -30
+          } > ../findings/target.txt
+
+      - name: Install analysis tools
+        run: |
+          python3 -m pip install --user --break-system-packages semgrep
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run Semgrep
+        run: |
+          mkdir -p findings
+          semgrep \
+            --config p/smart-contracts \
+            --json \
+            --output findings/semgrep.json \
+            target/solidity || true
+
+      - name: Security surface scan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# Security Surface Scan"
+            echo
+            echo "Generated: $(date -u)"
+            echo
+
+            echo "## Authorization"
+            grep -RInE \
+              --include="*.sol" \
+              'onlyOwner|onlyBridge|onlyRole|hasRole|msg\.sender|_msgSender' \
+              target/solidity 2>/dev/null |
+              head -n 500 || true
+
+            echo
+            echo "## External calls"
+            grep -RInE \
+              --include="*.sol" \
+              'delegatecall|call\{|staticcall|transferFrom|safeTransferFrom' \
+              target/solidity 2>/dev/null |
+              head -n 500 || true
+
+            echo
+            echo "## Signature / authentication"
+            grep -RInE \
+              --include="*.sol" \
+              'ecrecover|ECDSA|permit|signature|nonce' \
+              target/solidity 2>/dev/null |
+              head -n 500 || true
+
+            echo
+            echo "## Accounting"
+            grep -RInE \
+              --include="*.sol" \
+              'mint|burn|balanceOf|allowance|increaseBalance|decreaseBalance' \
+              target/solidity 2>/dev/null |
+              head -n 700 || true
+
+            echo
+            echo "## Bridge / cross-chain"
+            grep -RInE \
+              --include="*.sol" \
+              'Wormhole|Gateway|Bridge|receiveTbtc|sendTbtc|completeTransfer|deposit' \
+              target/solidity 2>/dev/null |
+              head -n 700 || true
+
+            echo
+            echo "## Time / block dependence"
+            grep -RInE \
+              --include="*.sol" \
+              'block\.timestamp|block\.number|blockhash' \
+              target/solidity 2>/dev/null |
+              head -n 400 || true
+
+            echo
+            echo "## Low-level Solidity"
+            grep -RInE \
+              --include="*.sol" \
+              'assembly|unchecked|selfdestruct' \
+              target/solidity 2>/dev/null |
+              head -n 400 || true
+          } > findings/security-surface.md
+
+      - name: Historical security analysis
+        shell: bash
+        run: |
+          {
+            echo "# Historical Security Analysis"
+            echo
+            echo "## Security-related commits"
+            echo
+
+            cd target
+
+            git log --all --oneline \
+              --grep="security\|vulnerability\|exploit\|audit\|critical\|high\|fix\|patch" \
+              -i |
+              head -n 300 || true
+
+            echo
+            echo "## Recent Solidity changes"
+
+            git log --all --oneline -- solidity/ |
+              head -n 300 || true
+          } > ../findings/history.md
+
+      - name: Build known issue filter
+        shell: bash
+        run: |
+          cat > findings/known-issues.md <<'EOF'
+          # Known / Excluded Issues
+
+          The following MUST NOT automatically become bounty reports.
+
+          - Public Threshold security advisories
+          - Immunefi known issues
+          - Previously reported vulnerabilities
+          - Duplicate findings
+          - Deprecated contracts
+          - Out-of-scope assets
+          - Admin-only compromise
+          - Privileged-address attacks
+          - Best-practice recommendations
+          - Feature requests
+          - DoS-only findings
+          - Speculative economic attacks
+          - UI-only issues without security impact
+          - Scanner warnings without demonstrated impact
+          - Mainnet exploitation
+          - Public-testnet exploitation
+          - Third-party system attacks
+          - Phishing
+          - Social engineering
+
+          A scanner result is only a candidate.
+
+          It is NOT automatically a valid bounty.
+          EOF
+
+      - name: Build candidate index
+        shell: bash
+        run: |
+          {
+            echo "# Candidate Index"
+            echo
+            echo "Automated triage only."
+            echo
+
+            echo "## Solidity files"
+            find target/solidity \
+              -type f \
+              -name "*.sol" |
+              sort
+
+            echo
+            echo "## Value-changing functions"
+
+            grep -RInE \
+              --include="*.sol" \
+              'function .*mint|function .*burn|function .*deposit|function .*redeem|function .*withdraw|function .*transfer|function .*approve' \
+              target/solidity 2>/dev/null |
+              head -n 1000 || true
+
+            echo
+            echo "## Authorization functions"
+
+            grep -RInE \
+              --include="*.sol" \
+              'function .*authorize|function .*deauthorize|function .*onlyOwner|function .*onlyBridge|function .*onlyRole' \
+              target/solidity 2>/dev/null |
+              head -n 1000 || true
+          } > findings/candidate-index.md
+
+      - name: Create validation checklist
+        shell: bash
+        run: |
+          cat > findings/BOUNTY_VALIDATION.md <<'EOF'
+          # Bounty Validation Checklist
+
+          A candidate must pass these checks before it can be considered
+          for a legitimate bounty report.
+
+          - [ ] In-scope asset confirmed
+          - [ ] Correct/current code version confirmed
+          - [ ] Not a known Immunefi issue
+          - [ ] Not a public security advisory
+          - [ ] Not a duplicate
+          - [ ] Concrete attacker-controlled path
+          - [ ] Concrete security impact
+          - [ ] Impact matches the bounty program
+          - [ ] Reproducible locally
+          - [ ] Runnable PoC exists
+          - [ ] No mainnet exploitation
+          - [ ] No public-testnet exploitation
+          - [ ] No third-party attack required
+          - [ ] No privileged compromise required
+          - [ ] Technical root cause identified
+          - [ ] Exact affected asset identified
+          - [ ] Reproduction steps documented
+          - [ ] Impact documented
+          - [ ] PoC evidence documented
+
+          IMPORTANT:
+
+          A scanner warning alone is NOT a bounty.
+          EOF
+
+      - name: Generate status
+        shell: bash
+        run: |
+          cat > findings/STATUS.md <<'EOF'
+          # 🤖 Threshold AI Bug Hunter
+
+          ## Status
+
+          🔵 RESEARCH RUN COMPLETED
+
+          This does NOT mean a bounty was earned.
+
+          ## Safety
+
+          - No mainnet exploitation
+          - No public-testnet exploitation
+          - No wallet required
+          - No money spent
+          - No automatic Immunefi submission
+
+          ## Next stage
+
+          Any candidate must be manually validated
+          and reproduced locally.
+
+          ## Bounty status
+
+          🟢 BUG BOUNTY WON
+
+          can only be used after the project/Immunefi
+          actually confirms the vulnerability and reward.
+          EOF
+
+      - name: Create research bundle
+        run: |
+          tar -czf threshold-research.tar.gz findings
+
+      - name: Upload research results
+        uses: actions/upload-artifact@v4
+        with:
+          name: threshold-ai-bug-hunt
+          path: |
+            findings/
+            threshold-research.tar.gz
+          retention-days: 14
+
+      - name: Write GitHub summary
+        run: |
+          {
+            echo "# 🤖 Threshold AI Bug Hunter"
+            echo
+            echo "## 🔵 Research completed"
+            echo
+            echo "Automated source analysis completed."
+            echo
+            echo "## Safety"
+            echo
+            echo "- No mainnet exploitation"
+            echo "- No public-testnet exploitation"
+            echo "- No wallet required"
+            echo "- No money spent"
+            echo "- No automatic bounty submission"
+            echo
+            echo "## Important"
+            echo
+            echo "A scanner finding is NOT automatically a bounty."
+            echo
+            echo "🟢 BUG BOUNTY WON is only valid after actual project/Immunefi confirmation and payment."
+          } >> "$GITHUB_STEP_SUMMARY"
